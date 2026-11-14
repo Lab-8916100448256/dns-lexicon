@@ -147,6 +147,9 @@ List of options
 .. _joker:
 .. include:: providers/joker.rst
 
+.. _lebureau:
+.. include:: providers/lebureau.rst
+
 .. _linode:
 .. include:: providers/linode.rst
 

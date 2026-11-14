@@ -76,7 +76,7 @@ Only DNS providers who have an API can be supported by `lexicon`.
 
 .. tag: providers-table-begin
 
-Lexicon currently supports 90 providers:
+Lexicon currently supports 91 providers:
 
 +-----------------+-----------------+-----------------+-----------------+-----------------+
 | aliyun_         | arvancloud_     | aurora_         | azure_          | cloudflare_     |
@@ -97,23 +97,25 @@ Lexicon currently supports 90 providers:
 +-----------------+-----------------+-----------------+-----------------+-----------------+
 | infoblox_       | infomaniak_     | internetbs_     | inwx_           | ionos_          |
 +-----------------+-----------------+-----------------+-----------------+-----------------+
-| joker_          | linode_         | linode4_        | localzone_      | luadns_         |
+| joker_          | lebureau_       | linode_         | linode4_        | localzone_      |
 +-----------------+-----------------+-----------------+-----------------+-----------------+
-| memset_         | misaka_         | mythicbeasts_   | namecheap_      | namecom_        |
+| luadns_         | memset_         | misaka_         | mythicbeasts_   | namecheap_      |
 +-----------------+-----------------+-----------------+-----------------+-----------------+
-| namesilo_       | netcup_         | nfsn_           | njalla_         | nsone_          |
+| namecom_        | namesilo_       | netcup_         | nfsn_           | njalla_         |
 +-----------------+-----------------+-----------------+-----------------+-----------------+
-| oci_            | onapp_          | online_         | ovh_            | plesk_          |
+| nsone_          | oci_            | onapp_          | online_         | ovh_            |
 +-----------------+-----------------+-----------------+-----------------+-----------------+
-| pointhq_        | porkbun_        | powerdns_       | qcloud_         | rackspace_      |
+| plesk_          | pointhq_        | porkbun_        | powerdns_       | qcloud_         |
 +-----------------+-----------------+-----------------+-----------------+-----------------+
-| rage4_          | rcodezero_      | regfish_        | route53_        | safedns_        |
+| rackspace_      | rage4_          | rcodezero_      | regfish_        | route53_        |
 +-----------------+-----------------+-----------------+-----------------+-----------------+
-| sakuracloud_    | scaleway_       | softlayer_      | timeweb_        | transip_        |
+| safedns_        | sakuracloud_    | scaleway_       | softlayer_      | timeweb_        |
 +-----------------+-----------------+-----------------+-----------------+-----------------+
-| ultradns_       | valuedomain_    | vercel_         | vultr_          | wedos_          |
+| transip_        | ultradns_       | valuedomain_    | vercel_         | vultr_          |
 +-----------------+-----------------+-----------------+-----------------+-----------------+
-| yandex_         | yandexcloud_    | zeit_           | zilore_         | zonomi_         |
+| wedos_          | yandex_         | yandexcloud_    | zeit_           | zilore_         |
++-----------------+-----------------+-----------------+-----------------+-----------------+
+| zonomi_         |                 |                 |                 |                 |
 +-----------------+-----------------+-----------------+-----------------+-----------------+
 
 .. tag: providers-table-end
@@ -164,6 +166,7 @@ Lexicon currently supports 90 providers:
 .. _inwx: https://www.inwx.de/en/offer/api
 .. _ionos: https://developer.hosting.ionos.de/docs/dns
 .. _joker: https://joker.com/faq/index.php?action=show&cat=39
+.. _lebureau: https://lebureau.coop/docs/faq/
 .. _linode: https://www.linode.com/api/dns
 .. _linode4: https://developers.linode.com/api/docs/v4#tag/domains
 .. _localzone:
