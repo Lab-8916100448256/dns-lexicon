@@ -57,6 +57,7 @@ lexicon/providers/ionos.py          @texttheater
 lexicon/providers/joker.py          @adferrand
 src/lexicon/_private/providers/lebureau.py fabrice.bellamy@distrilab.fr
 tests/providers/test_lebureau.py    fabrice.bellamy@distrilab.fr
+tests/providers/lebureau_live.py    fabrice.bellamy@distrilab.fr
 lexicon/providers/linode.py         @trinopoty
 lexicon/providers/linode4.py        @trinopoty
 lexicon/providers/localzone.py      @ags-slc

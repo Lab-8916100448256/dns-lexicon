@@ -8,12 +8,15 @@ These tests run the shared IntegrationTestsV2 contract and protocol regressions
 against a disposable in-memory authority with a public dummy key. dnspython
 still encodes and validates the DNS wire messages and TSIG signatures; only the
 socket transport is substituted. No live credentials or private zone dumps are
-needed. LEXICON_LIVE_TESTS=true does not switch these tests to Le Bureau's live
-servers or generate DNS recordings; live validation uses a separate harness.
+needed by default. With LEXICON_LIVE_TESTS=true, the shared contract uses a real
+server and LEXICON_LEBUREAU_TEST_DOMAIN plus LEXICON_LEBUREAU_AUTH_TOKEN. Each test
+owns a random namespace and cleans up its records. Protocol error regressions
+remain offline. DNS traffic is never recorded by VCR.py.
 """
 
 import base64
 import io
+import os
 import struct
 
 import dns.exception
@@ -30,11 +33,12 @@ import dns.zone
 import pytest
 import tldextract
 from integration_tests import IntegrationTestsV2
+from lebureau_live import LiveZone, live_config, wait_until
 
 from lexicon._private.discovery import find_providers
 from lexicon._private.providers.lebureau import Provider
 from lexicon.client import Client
-from lexicon.config import ConfigResolver
+from lexicon.config import ConfigResolver, DictConfigSource
 from lexicon.exceptions import AuthenticationError, LexiconError
 
 TOKEN = "hmac-sha512:test-key:" + base64.b64encode(b"public-test-secret").decode()
@@ -43,6 +47,17 @@ ZONE = """
 @ 300 IN NS ns.example.com.
 ns 300 IN A 192.0.2.53
 """
+
+
+RECORD_CASES = [
+    ("A", "192.0.2.1"),
+    ("AAAA", "2001:db8::1"),
+    ("MX", "10 mail.example.com."),
+    ("TXT", "v=spf1 -all"),
+    ("CNAME", "target.example.com."),
+    ("SRV", "10 20 443 service.example.com."),
+    ("CAA", '0 issue "letsencrypt.org"'),
+]
 
 
 @pytest.fixture(autouse=True)
@@ -201,7 +216,19 @@ def config(server, **options):
     )
 
 
-@pytest.mark.usefixtures("authoritative_server")
+@pytest.fixture
+def live_zone():
+    try:
+        zone = LiveZone(live_config())
+    except ValueError as error:
+        pytest.fail(str(error), pytrace=False)
+    zone.prepare()  # No cleanup is needed if read-only preflight fails.
+    try:
+        yield zone
+    finally:
+        zone.cleanup()
+
+
 class TestLeBureauProvider(IntegrationTestsV2):
     """Run Lexicon's shared contract against signed DNS wire messages."""
 
@@ -209,10 +236,23 @@ class TestLeBureauProvider(IntegrationTestsV2):
     domain = "example.com"
 
     @pytest.fixture(autouse=True)
-    def configure_server(self, authoritative_server):
-        self.server = authoritative_server
+    def configure_server(self, request):
+        self.live_zone = None
+        if os.environ.get("LEXICON_LIVE_TESTS") == "true":
+            self.live_zone = request.getfixturevalue("live_zone")
+            self.domain = self.live_zone.domain
+        else:
+            self.server = request.getfixturevalue("authoritative_server")
+            self.domain = "example.com"
+
+    def _construct_authenticated_provider(self):
+        if self.live_zone is not None:
+            return self.live_zone.provider()
+        return super()._construct_authenticated_provider()
 
     def _test_parameters_overrides(self):
+        if self.live_zone is not None:
+            return {}
         return {
             "auth_token": TOKEN,
             "ddns_server": "127.0.0.1",
@@ -222,19 +262,65 @@ class TestLeBureauProvider(IntegrationTestsV2):
     def _test_fallback_fn(self):
         return lambda _: None
 
+    @pytest.mark.parametrize("rtype,content", RECORD_CASES)
+    def test_public_client_round_trip(self, rtype, content):
+        if self.live_zone is not None:
+            settings = self.live_zone.config
+            owner = self.live_zone.name("client")
+            moved = self.live_zone.name("moved-client")
+            # Register both possible owners before any potentially ambiguous write.
+            self.live_zone.names.update((owner, moved))
+        else:
+            settings = config(self.server)
+            owner = "client.example.com"
+            moved = "moved-client.example.com"
+        with Client(settings) as client:
+            assert client.create_record(rtype, owner, content)
+        settings.add_config_source(
+            DictConfigSource({"action": "list", "type": rtype}), 0
+        )
 
-@pytest.mark.parametrize(
-    "rtype,content",
-    [
-        ("A", "192.0.2.1"),
-        ("AAAA", "2001:db8::1"),
-        ("MX", "10 mail.example.com."),
-        ("TXT", "v=spf1 -all"),
-        ("CNAME", "target.example.com."),
-        ("SRV", "10 20 443 service.example.com."),
-        ("CAA", '0 issue "letsencrypt.org"'),
-    ],
-)
+        def records(name):
+            # Type-only listings via the public legacy API used by integrations.
+            return [r for r in Client(settings).execute() if r["name"] == name]
+
+        wait_until(lambda: records(owner))
+        record = records(owner)[0]
+        assert record["ttl"] == 3600
+        with Client(settings) as client:
+            assert client.update_record(record["id"], name=moved)
+        wait_until(lambda: records(moved) and not records(owner))
+        changed = records(moved)[0]
+        with Client(settings) as client:
+            assert client.delete_record(changed["id"])
+        wait_until(lambda: not records(moved))
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "v=DKIM1; p=" + "a" * 800,
+            "é😀" * 130,
+            '"first" "second"',
+        ],
+    )
+    def test_txt_content_and_siblings(self, value):
+        provider = self._construct_authenticated_provider()
+        provider.create_record("TXT", "txt", value)
+        provider.create_record("TXT", "txt", "keep-sibling")
+        record = provider.list_records("TXT", "txt", value)[0]
+        # A fresh authenticated provider must resolve the previous client's ID.
+        provider = self._construct_authenticated_provider()
+        assert provider.update_record(record["id"], content="replacement")
+        assert provider.list_records("TXT", "txt", "keep-sibling")
+        changed = provider.list_records("TXT", "txt", "replacement")[0]
+        provider = self._construct_authenticated_provider()
+        assert provider.delete_record(changed["id"])
+        assert [r["content"] for r in provider.list_records("TXT", "txt")] == [
+            "keep-sibling"
+        ]
+
+
+@pytest.mark.parametrize("rtype,content", RECORD_CASES)
 def test_public_client_fresh_identifier_round_trip(
     authoritative_server, rtype, content
 ):
@@ -592,3 +678,244 @@ def test_multiline_txt_input(authoritative_server):
     provider = Provider(config(authoritative_server))
     provider.create_record("TXT", "test", '"first"\n"second"')
     assert provider.list_records("TXT", "test")[0]["content"] == "firstsecond"
+
+
+def test_live_configuration_requires_explicit_domain_and_key(monkeypatch):
+    monkeypatch.delenv("LEXICON_LEBUREAU_TEST_DOMAIN", raising=False)
+    monkeypatch.delenv("LEXICON_LEBUREAU_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("LEXICON_LEBUREAU_TOKEN", raising=False)
+    with pytest.raises(ValueError, match="LEXICON_LEBUREAU_TEST_DOMAIN"):
+        live_config()
+    monkeypatch.setenv("LEXICON_LEBUREAU_TEST_DOMAIN", "example.com")
+    with pytest.raises(ValueError, match="LEXICON_LEBUREAU_AUTH_TOKEN"):
+        live_config()
+    monkeypatch.setenv("LEXICON_LEBUREAU_AUTH_TOKEN", TOKEN)
+    assert live_config().resolve("lexicon:domain") == "example.com"
+
+
+def test_live_namespace_and_cleanup_preserve_existing_records(authoritative_server):
+    backend = Provider(config(authoritative_server))
+    backend.create_record("TXT", "existing", "untouched")
+    original = backend.list_records()
+    zone = LiveZone(config(authoritative_server))
+    zone.prepare()
+    provider = zone.provider()
+    assert provider.list_records() == []
+    provider.create_record("TXT", "docs", "one")
+    provider.create_record("TXT", "docs", "two")
+    record = provider.list_records("TXT", "docs")[0]
+    assert record["name"] == f"docs.{zone.domain}"
+    assert provider.list_records("TXT", f"docs.{zone.domain}.")
+    existing = backend.list_records("TXT", "existing")[0]
+    with pytest.raises(LexiconError, match="namespace"):
+        provider.update_record(existing["id"], content="changed")
+    assert provider.delete_record(existing["id"])
+    assert backend.list_records("TXT", "existing") == [existing]
+    zone.provider().update_record(record["id"], name="renamed")
+    zone.cleanup()
+    assert backend.list_records() == original
+
+
+@pytest.mark.parametrize(
+    "name", ["example.com", "outside.example.com.", "outside.invalid."]
+)
+def test_live_namespace_rejects_external_owners(authoritative_server, name):
+    zone = LiveZone(config(authoritative_server))
+    with pytest.raises(ValueError, match="namespace"):
+        zone.name(name)
+    assert zone.name("@") == zone.domain
+    assert not zone.owns("example.com")
+
+
+def test_live_namespace_collision_stops_before_writes(authoritative_server):
+    zone = LiveZone(config(authoritative_server), prefix="collision")
+    backend = Provider(config(authoritative_server))
+    backend.create_record("TXT", "existing.collision", "untouched")
+    before = authoritative_server.writes
+    with pytest.raises(LexiconError, match="already exists"):
+        zone.prepare()
+    assert authoritative_server.writes == before
+    assert not zone.names
+
+
+def test_live_cleanup_includes_write_with_lost_reply(authoritative_server, monkeypatch):
+    zone = LiveZone(config(authoritative_server))
+    zone.prepare()
+    provider = zone.provider()
+    original = provider.backend._send
+
+    def lose_reply(update):
+        original(update)
+        raise LexiconError("reply lost")
+
+    monkeypatch.setattr(provider.backend, "_send", lose_reply)
+    with pytest.raises(LexiconError, match="reply lost"):
+        provider.create_record("TXT", "uncertain", "value")
+    assert zone.names == {zone.name("uncertain")}
+    zone.cleanup()
+    assert provider.list_records() == []
+
+
+def test_live_cleanup_attempts_every_owner(authoritative_server, monkeypatch):
+    zone = LiveZone(config(authoritative_server))
+    zone.prepare()
+    provider = zone.provider()
+    provider.create_record("TXT", "first", "one")
+    provider.create_record("TXT", "second", "two")
+    original = zone._cleanup_name
+
+    def refuse_first(name):
+        if name == zone.name("first"):
+            raise LexiconError("REFUSED")
+        return original(name)
+
+    monkeypatch.setattr(zone, "_cleanup_name", refuse_first)
+    with pytest.raises(LexiconError, match="cleanup failed"):
+        zone.cleanup()
+    assert not provider.list_records("TXT", "second")
+    assert provider.list_records("TXT", "first")
+    monkeypatch.setattr(zone, "_cleanup_name", original)
+    zone.cleanup()
+
+
+def test_live_polling_timeout(monkeypatch):
+    import lebureau_live
+
+    ticks = iter([0, 2])
+    monkeypatch.setattr(lebureau_live.time, "monotonic", lambda: next(ticks))
+    with pytest.raises(AssertionError, match="converge"):
+        wait_until(lambda: False, timeout=1)
+
+
+def test_live_public_client_preserves_delegated_zone(authoritative_server, monkeypatch):
+    authoritative_server.zone = dns.zone.from_text(
+        ZONE,
+        origin="delegated.example.com.",
+        relativize=False,
+    )
+    monkeypatch.setenv("LEXICON_LEBUREAU_TEST_DOMAIN", "delegated.example.com")
+    monkeypatch.setenv("LEXICON_LEBUREAU_AUTH_TOKEN", TOKEN)
+    monkeypatch.setenv("LEXICON_LEBUREAU_DDNS_SERVER", "127.0.0.1")
+    zone = LiveZone(live_config())
+    zone.prepare()
+    owner = zone.name("client")
+    zone.names.add(owner)
+    try:
+        with Client(zone.config) as client:
+            client.create_record("CAA", owner, '0 issue "example.org"')
+            assert client.list_records("CAA", owner)[0]["name"] == owner
+    finally:
+        zone.cleanup()
+
+
+def test_live_cleanup_accepts_delete_with_lost_reply(authoritative_server, monkeypatch):
+    zone = LiveZone(config(authoritative_server))
+    zone.prepare()
+    zone.provider().create_record("TXT", "uncertain-delete", "value")
+    original = Provider._send
+    writes = authoritative_server.writes
+
+    def lose_reply(provider, update):
+        original(provider, update)
+        raise LexiconError("reply lost")
+
+    monkeypatch.setattr(Provider, "_send", lose_reply)
+    zone.cleanup()
+    assert authoritative_server.writes == writes + 1
+    assert zone.provider().list_records() == []
+
+
+def test_live_cleanup_retries_failed_verification_read(
+    authoritative_server, monkeypatch
+):
+    import lebureau_live
+
+    zone = LiveZone(config(authoritative_server))
+    zone.prepare()
+    zone.provider().create_record("TXT", "verification", "value")
+    original = Provider.list_records
+    writes = authoritative_server.writes
+    interrupted = False
+
+    def interrupt_read(provider, *args, **kwargs):
+        nonlocal interrupted
+        if authoritative_server.writes > writes and not interrupted:
+            interrupted = True
+            raise LexiconError("temporary AXFR failure after delete")
+        return original(provider, *args, **kwargs)
+
+    monkeypatch.setattr(Provider, "list_records", interrupt_read)
+    monkeypatch.setattr(lebureau_live.time, "sleep", lambda _: None)
+    zone.cleanup()
+    assert interrupted
+    assert authoritative_server.writes == writes + 1
+    assert zone.provider().list_records() == []
+
+
+def test_live_cleanup_retries_authentication_read(authoritative_server, monkeypatch):
+    import lebureau_live
+
+    zone = LiveZone(config(authoritative_server))
+    zone.prepare()
+    zone.provider().create_record("TXT", "auth-read", "value")
+    original = Provider._load_zone
+    interrupted = False
+
+    def interrupt_read(provider):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise LexiconError("temporary authentication transfer failure")
+        return original(provider)
+
+    monkeypatch.setattr(Provider, "_load_zone", interrupt_read)
+    monkeypatch.setattr(lebureau_live.time, "sleep", lambda _: None)
+    zone.cleanup()
+    assert interrupted
+    assert zone.provider().list_records() == []
+
+
+def test_live_cleanup_retains_delete_error_without_retry(
+    authoritative_server, monkeypatch
+):
+    import itertools
+
+    import lebureau_live
+
+    zone = LiveZone(config(authoritative_server))
+    zone.prepare()
+    zone.provider().create_record("TXT", "refused", "value")
+    original = Provider._send
+    attempts = 0
+
+    def refuse_delete(provider, update):
+        nonlocal attempts
+        attempts += 1
+        raise LexiconError("Le Bureau rejected DNS update: REFUSED")
+
+    ticks = itertools.count(step=60)
+    monkeypatch.setattr(lebureau_live.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(Provider, "_send", refuse_delete)
+    with pytest.raises(LexiconError, match="cleanup failed") as caught:
+        zone.cleanup()
+    assert "REFUSED" in str(caught.value)
+    assert "TXT" in str(caught.value)
+    assert zone.name("refused") in str(caught.value)
+    assert attempts == 1
+    monkeypatch.setattr(Provider, "_send", original)
+    zone.cleanup()
+
+
+def test_live_polling_retains_last_read_error(monkeypatch):
+    import lebureau_live
+
+    ticks = iter([0, 2])
+    monkeypatch.setattr(lebureau_live.time, "monotonic", lambda: next(ticks))
+
+    def failed_read():
+        raise LexiconError("AXFR failed")
+
+    with pytest.raises(
+        AssertionError, match="last read error: LexiconError: AXFR failed"
+    ):
+        wait_until(failed_read, timeout=1)

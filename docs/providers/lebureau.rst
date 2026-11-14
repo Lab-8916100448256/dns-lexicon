@@ -53,3 +53,27 @@ lebureau
     dnspython; no HTTP VCR cassettes or live credentials are needed::
 
         pytest tests/providers/test_lebureau.py
+
+    To run the shared V2 contract and additional Client/TXT integration cases
+    against a live zone, explicitly select an authorized test domain and key::
+
+        export LEXICON_LEBUREAU_TEST_DOMAIN='example.com'
+        export LEXICON_LEBUREAU_AUTH_TOKEN='hmac-sha512:my-key:BASE64_SECRET'
+        LEXICON_LIVE_TESTS=true pytest tests/providers/test_lebureau.py
+
+    Live tests use the same server, port and timeout environment options as the
+    provider, defaulting to ``ns2.lebureau.coop``. The domain must be the actual
+    hosted zone (including a delegated zone when applicable). Missing domain or
+    credentials fail before any network access; the tests never silently fall
+    back to dummy credentials in live mode.
+
+    Each integration test checks that a randomly generated namespace is unused,
+    places its fixture names beneath it, and attempts cleanup during teardown,
+    including after a failed test or a write with a lost reply. Cleanup failures
+    fail the test and report the affected owners and underlying provider errors.
+    Cleanup verifies the result even if a delete reply is lost. Writes are never
+    retried; read-back uses bounded polling for convergence and transient read
+    failures. Pre-existing owners and the
+    zone apex are not used as write fixtures. Independent protocol/error
+    regressions still use the in-memory authority even in live mode. No DNS
+    cassettes are generated.
