@@ -82,6 +82,14 @@ class DNSServer:
         self.corrupt = False
         self.messages = 0
         self.writes = 0
+        self.before_update = None
+
+    def changed(self):
+        """Publish a new SOA serial after a fixture zone change."""
+        soa = self.zone.find_rdataset(self.zone.origin, "SOA")
+        data = next(iter(soa))
+        soa.clear()
+        soa.add(data.replace(serial=data.serial + 1))
 
 
 class DNSHandler:
@@ -106,6 +114,13 @@ class DNSHandler:
             self.send(response)
         elif query.opcode() == dns.opcode.UPDATE:
             server.writes += 1
+            if server.before_update:
+                callback, server.before_update = server.before_update, None
+                callback()
+            response.set_rcode(self.check_prerequisites(query))
+            if response.rcode() != dns.rcode.NOERROR:
+                self.send(response)
+                return
             for rrset in query.authority:
                 owner = rrset.name.derelativize(server.zone.origin)
                 if rrset.deleting == dns.rdataclass.ANY:
@@ -118,12 +133,21 @@ class DNSHandler:
                         if not rdataset:
                             server.zone.delete_rdataset(owner, rrset.rdtype)
                 else:
+                    node = server.zone.get_node(owner)
+                    if node and any(
+                        (rrset.rdtype == dns.rdatatype.CNAME)
+                        != (dataset.rdtype == dns.rdatatype.CNAME)
+                        for dataset in node.rdatasets
+                    ):
+                        # RFC 2136 3.4.2.2: silently ignore conflicting adds.
+                        continue
                     rdataset = server.zone.find_rdataset(
                         owner, rrset.rdtype, create=True
                     )
                     for data in rrset:
                         rdataset.add(data)
                     rdataset.ttl = rrset.ttl
+            server.changed()
             self.send(response)
         else:
             soa = server.zone.find_rrset(server.zone.origin, "SOA")
@@ -142,6 +166,39 @@ class DNSHandler:
                 response.flags |= dns.flags.AA
                 response.answer.append(rrset)
                 context = self.send(response, multi=True, context=context)
+
+    def check_prerequisites(self, query):
+        """Evaluate name/RRset existence and exact RDATA sets before any writes."""
+        values = {}
+        for rrset in query.prerequisite:
+            owner = rrset.name.derelativize(self.server.zone.origin)
+            node = self.server.zone.get_node(owner)
+            dataset = self.server.zone.get_rdataset(owner, rrset.rdtype)
+            exists = (
+                bool(node and node.rdatasets)
+                if rrset.rdtype == dns.rdatatype.ANY
+                else bool(dataset)
+            )
+            if rrset.deleting == dns.rdataclass.NONE:
+                if exists:
+                    return (
+                        dns.rcode.YXDOMAIN
+                        if rrset.rdtype == dns.rdatatype.ANY
+                        else dns.rcode.YXRRSET
+                    )
+            elif rrset.deleting == dns.rdataclass.ANY:
+                if not exists:
+                    return (
+                        dns.rcode.NXDOMAIN
+                        if rrset.rdtype == dns.rdatatype.ANY
+                        else dns.rcode.NXRRSET
+                    )
+            else:
+                values.setdefault((owner, rrset.rdtype), set()).update(rrset)
+        for (owner, rtype), wanted in values.items():
+            if set(self.server.zone.get_rdataset(owner, rtype) or ()) != wanted:
+                return dns.rcode.NXRRSET
+        return dns.rcode.NOERROR
 
     def send(self, response, multi=False, context=None):
         server = self.server
@@ -627,13 +684,14 @@ def test_default_endpoint(authoritative_server, monkeypatch, server):
     assert lookups == [("ns2.lebureau.coop", "A"), ("ns2.lebureau.coop", "AAAA")]
 
 
-def test_ttl_reset_and_selected_value_move(authoritative_server):
+@pytest.mark.parametrize("ttl", [0, "0"])
+def test_ttl_reset_and_selected_value_move(authoritative_server, ttl):
     server = authoritative_server
     with Client(config(server, ttl=120)) as client:
         client.create_record("TXT", "original", "one")
         client.create_record("TXT", "original", "two")
         first = client.list_records("TXT", "original", "one")[0]
-    with Client(config(server, ttl=0)) as client:
+    with Client(config(server, ttl=ttl)) as client:
         client.update_record(first["id"], name="moved")
         assert client.list_records("TXT", "moved")[0]["ttl"] == 3600
         remaining = client.list_records("TXT", "original")
@@ -713,7 +771,10 @@ def test_live_namespace_and_cleanup_preserve_existing_records(authoritative_serv
     assert backend.list_records("TXT", "existing") == [existing]
     zone.provider().update_record(record["id"], name="renamed")
     zone.cleanup()
-    assert backend.list_records() == original
+    # Updates legitimately advance SOA serials; unrelated user RRs must survive.
+    assert [r for r in backend.list_records() if r["type"] != "SOA"] == [
+        r for r in original if r["type"] != "SOA"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -919,3 +980,208 @@ def test_live_polling_retains_last_read_error(monkeypatch):
         AssertionError, match="last read error: LexiconError: AXFR failed"
     ):
         wait_until(failed_read, timeout=1)
+
+
+@pytest.mark.parametrize(
+    "operation", ["delete_set", "delete_content", "delete_id", "update_id"]
+)
+def test_distinct_txt_wire_values_survive_listing(authoritative_server, operation):
+    server = authoritative_server
+    server.zone.replace_rdataset(
+        "txt.example.com.",
+        dns.rrset.from_text(
+            "txt.example.com.", 120, "IN", "TXT", '"ab" "cd"', '"abcd"'
+        ),
+    )
+    provider = Provider(config(server))
+    records = provider.list_records("TXT", "txt", "abcd")
+    assert len(records) == 2
+    assert len({record["id"] for record in records}) == 2
+    assert sorted(records, key=lambda r: r["id"]) == sorted(
+        Provider(config(server)).list_records("TXT", "txt", '"ab" "cd"'),
+        key=lambda r: r["id"],
+    )
+    assert provider.create_record("TXT", "txt", "abcd")
+    assert sorted(provider.list_records("TXT", "txt"), key=lambda r: r["id"]) == sorted(
+        records, key=lambda r: r["id"]
+    )
+    selected, sibling = records
+    if operation == "delete_set":
+        assert provider.delete_record(rtype="TXT", name="txt")
+    elif operation == "delete_content":
+        assert provider.delete_record(rtype="TXT", name="txt", content="abcd")
+    elif operation == "delete_id":
+        assert provider.delete_record(selected["id"])
+    else:
+        assert provider.update_record(selected["id"], content="changed")
+    remaining = provider.list_records("TXT", "txt")
+    if operation in ("delete_set", "delete_content"):
+        assert not remaining
+        assert server.zone.get_rdataset("txt.example.com.", "TXT") is None
+    else:
+        assert sibling in remaining
+        assert selected not in remaining
+        assert len(remaining) == (2 if operation == "update_id" else 1)
+
+
+@pytest.mark.parametrize("ttl,expected", [("0", 3600), ("180", 180)])
+def test_environment_ttl_create_and_update(
+    authoritative_server, monkeypatch, ttl, expected
+):
+    with Client(config(authoritative_server, ttl=120)) as client:
+        client.create_record("TXT", "original", "value")
+        original = client.list_records("TXT", "original")[0]
+    monkeypatch.setenv("LEXICON_TTL", ttl)
+    with Client(config(authoritative_server).with_env()) as client:
+        client.create_record("TXT", "created", "value")
+        assert client.list_records("TXT", "created")[0]["ttl"] == expected
+        client.update_record(original["id"], name="moved")
+        assert client.list_records("TXT", "moved")[0]["ttl"] == expected
+
+
+@pytest.mark.parametrize(
+    "source_type,source_value,target_type,target_value",
+    [
+        ("CNAME", "old.example.com.", "A", "192.0.2.1"),
+        ("A", "192.0.2.1", "CNAME", "target.example.com."),
+        ("CNAME", "old.example.com.", "CNAME", "other.example.com."),
+    ],
+)
+def test_rename_rejects_conflicting_destination(
+    authoritative_server, source_type, source_value, target_type, target_value
+):
+    provider = Provider(config(authoritative_server))
+    provider.create_record(source_type, "source", source_value)
+    provider.create_record(target_type, "destination", target_value)
+    before = provider.list_records()
+    source = provider.list_records(source_type, "source")[0]
+    writes = authoritative_server.writes
+    with pytest.raises(LexiconError, match="destination conflicts"):
+        provider.update_record(source["id"], name="destination")
+    assert authoritative_server.writes == writes
+    assert provider.list_records() == before
+
+
+@pytest.mark.parametrize("change", ["destination", "source", "source_sibling"])
+def test_rename_prerequisites_reject_concurrent_change(authoritative_server, change):
+    server = authoritative_server
+    provider = Provider(config(server))
+    provider.create_record("CNAME", "source", "old.example.com.")
+    source = provider.list_records("CNAME", "source")[0]
+
+    def concurrent_write():
+        if change == "destination":
+            # Do not advance SOA here: the name-absence prerequisite must catch
+            # a conflicting add even when the server defers serial increments.
+            server.zone.replace_rdataset(
+                "destination.example.com.",
+                dns.rrset.from_text(
+                    "destination.example.com.", 120, "IN", "A", "192.0.2.1"
+                ),
+            )
+        else:
+            # Likewise, test the exact source prerequisite independently of SOA.
+            server.zone.replace_rdataset(
+                "source.example.com.",
+                dns.rrset.from_text(
+                    "source.example.com.", 120, "IN", "CNAME", "new.example.com."
+                ),
+            )
+
+    if change == "source_sibling":
+        provider.delete_record(source["id"])
+        provider.create_record("TXT", "source", "one")
+        source = provider.list_records("TXT", "source")[0]
+
+        def concurrent_write():
+            server.zone.find_rdataset("source.example.com.", "TXT").add(
+                provider._rdata("TXT", "two")
+            )
+
+    server.before_update = concurrent_write
+    writes = server.writes
+    with pytest.raises(LexiconError, match="YXDOMAIN|NXRRSET"):
+        provider.update_record(source["id"], name="destination")
+    assert server.writes == writes + 1
+    assert provider.list_records(name="source")
+    if change == "destination":
+        assert provider.list_records("CNAME", "source") == [source]
+        assert provider.list_records("A", "destination")
+    else:
+        assert not provider.list_records(name="destination")
+
+
+def test_wire_authority_silently_ignores_conflicting_add(authoritative_server):
+    provider = Provider(config(authoritative_server))
+    provider.create_record("CNAME", "source", "target.example.com.")
+    provider.create_record("A", "destination", "192.0.2.1")
+    update = provider._update()
+    update.delete("source", "CNAME")
+    update.add("destination", 120, "CNAME", "target.example.com.")
+    # Reproduce the original data loss with an unguarded update: NOERROR does
+    # not mean the replacement was added.
+    assert provider._send(update)
+    assert not provider.list_records("CNAME", "source")
+    assert not provider.list_records("CNAME", "destination")
+    assert provider.list_records("A", "destination")
+
+
+@pytest.mark.parametrize(
+    "rtype,content", [("A", "192.0.2.2"), ("CNAME", "target.example.com.")]
+)
+def test_rename_into_compatible_rrset(authoritative_server, rtype, content):
+    provider = Provider(config(authoritative_server))
+    provider.create_record(rtype, "source", content)
+    provider.create_record(rtype, "destination", content)
+    source = provider.list_records(rtype, "source")[0]
+    assert provider.update_record(source["id"], name="destination")
+    assert not provider.list_records(rtype, "source")
+    assert len(provider.list_records(rtype, "destination")) == 1
+
+
+@pytest.mark.parametrize(
+    "rtype,content", [("A", "192.0.2.2"), ("CNAME", "target.example.com.")]
+)
+def test_cname_type_conversion_at_same_owner(authoritative_server, rtype, content):
+    provider = Provider(config(authoritative_server))
+    old_type, old_content = (
+        ("CNAME", "target.example.com.") if rtype == "A" else ("A", "192.0.2.2")
+    )
+    provider.create_record(old_type, "source", old_content)
+    source = provider.list_records(old_type, "source")[0]
+    assert provider.update_record(source["id"], rtype=rtype, content=content)
+    records = provider.list_records(name="source")
+    assert len(records) == 1
+    assert records[0]["type"] == rtype
+    assert records[0]["content"] == content
+
+
+@pytest.mark.parametrize("change", ["cname", "soa"])
+def test_update_existing_destination_prerequisites(authoritative_server, change):
+    server = authoritative_server
+    provider = Provider(config(server))
+    provider.create_record("A", "source", "192.0.2.1")
+    provider.create_record("A", "destination", "192.0.2.2")
+    source = provider.list_records("A", "source")[0]
+
+    def concurrent_write():
+        if change == "soa":
+            server.changed()
+        else:
+            server.zone.delete_rdataset("destination.example.com.", "A")
+            server.zone.replace_rdataset(
+                "destination.example.com.",
+                dns.rrset.from_text(
+                    "destination.example.com.",
+                    120,
+                    "IN",
+                    "CNAME",
+                    "target.example.com.",
+                ),
+            )
+
+    server.before_update = concurrent_write
+    with pytest.raises(LexiconError, match="NXRRSET|YXRRSET"):
+        provider.update_record(source["id"], name="destination")
+    assert provider.list_records("A", "source") == [source]
+    assert not provider.list_records("A", "destination", "192.0.2.1")

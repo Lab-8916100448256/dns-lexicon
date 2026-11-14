@@ -184,12 +184,9 @@ class Provider(BaseProvider):
         for owner, rdataset in zone.iterate_rdatasets():
             for rdata in rdataset:
                 content = self._content(rdata)
-                # TXT identity is independent of character-string boundaries.
-                wire = (
-                    b"".join(rdata.strings)
-                    if rdata.rdtype == dns.rdatatype.TXT
-                    else rdata.to_digestable(self.zone)
-                )
+                # IDs identify exact DNS RDATA, including TXT string boundaries.
+                # Logical TXT equality is used only for content comparisons.
+                wire = rdata.to_digestable(self.zone)
                 rtype = dns.rdatatype.to_text(rdata.rdtype)
                 owner = owner.canonicalize()
                 identifier = hashlib.sha256(
@@ -327,7 +324,7 @@ class Provider(BaseProvider):
         if self.list_records(rtype, name, content):
             return True
         update = self._update()
-        update.add(owner, int(self._ttl or 3600), data)
+        update.add(owner, int(self._ttl or 0) or 3600, data)
         return self._send(update)
 
     def update_record(self, identifier=None, rtype=None, name=None, content=None):
@@ -351,8 +348,57 @@ class Provider(BaseProvider):
                 content if content is not None else record["content"],
             )
         update = self._update()
-        update.delete(self._name(record["name"]), old_data)
-        ttl = record["ttl"] if self._ttl is None else int(self._ttl or 3600)
+        old_owner = self._name(record["name"])
+        destination = [
+            (existing, value)
+            for existing, value in self._records.values()
+            if self._name(existing["name"]) == owner and existing["id"] != record["id"]
+        ]
+        for existing, value in destination:
+            if value.rdtype in (
+                dns.rdatatype.RRSIG,
+                dns.rdatatype.NSEC,
+                dns.rdatatype.NSEC3,
+                dns.rdatatype.SIG,
+                dns.rdatatype.KEY,
+                dns.rdatatype.NXT,
+            ):
+                continue
+            if (data.rdtype == dns.rdatatype.CNAME) != (
+                value.rdtype == dns.rdatatype.CNAME
+            ) or (data.rdtype == dns.rdatatype.CNAME and data != value):
+                raise LexiconError("Le Bureau update destination conflicts with CNAME")
+
+        # Guard the AXFR snapshot as well as the selected RRset. RFC 2136 can
+        # silently ignore conflicting additions even after deleting the source.
+        # The SOA guard also covers changes of other types during a conversion
+        # to CNAME at the same owner; unrelated zone changes may reject updates.
+        for existing, value in self._records.values():
+            if existing["type"] == "SOA" and self._name(existing["name"]) == self.zone:
+                update.present(self.zone, value)
+        source_data = [
+            value
+            for existing, value in self._records.values()
+            if existing["name"] == record["name"] and existing["type"] == record["type"]
+        ]
+        update.present(old_owner, *source_data)
+        if owner != old_owner and not destination:
+            update.absent(owner)
+        elif data.rdtype != dns.rdatatype.CNAME and not (
+            owner == old_owner and old_data.rdtype == dns.rdatatype.CNAME
+        ):
+            update.absent(owner, "CNAME")
+        elif owner != old_owner:
+            update.present(
+                owner,
+                *[
+                    value
+                    for _, value in destination
+                    if value.rdtype == dns.rdatatype.CNAME
+                ],
+            )
+        update.delete(old_owner, old_data)
+        ttl = record["ttl"] if self._ttl is None else (int(self._ttl or 0) or 3600)
         update.add(owner, ttl, data)
         return self._send(update)
 

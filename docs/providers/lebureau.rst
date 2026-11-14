@@ -41,10 +41,17 @@ lebureau
     Long values are split into strings of at most 255 bytes. Listings return
     concatenated logical content without surrounding quotes where possible;
     binary content and content starting with a quote use DNS quoted syntax.
-    Record identifiers are stable across clients and TXT string boundaries.
+    Record identifiers are stable across clients and identify exact DNS RDATA,
+    including TXT string boundaries. Distinct wire values with the same logical
+    TXT content are listed separately; content filters match all such values.
     Updates and deletes by ID or content preserve other values in the RRset.
     TTL applies to the entire RRset: an update without an explicit TTL preserves
     the selected record's TTL; zero resets it to the default of 3600 seconds.
+
+    Updates reject incompatible CNAME destinations before deleting the source.
+    DNS prerequisites check the source RRset, destination compatibility and the
+    transferred SOA. Concurrent zone changes can cause an update to be rejected,
+    including changes elsewhere in the zone. Check the records before retrying.
 
     The provider implements the protocol independently of ``ddns`` to keep
     existing DDNS consumers unchanged. Its tests run Lexicon's shared V2
