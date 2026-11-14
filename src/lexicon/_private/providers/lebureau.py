@@ -318,12 +318,76 @@ class Provider(BaseProvider):
             keyalgorithm=self.key.algorithm,
         )
 
+    def _guard_addition(self, update, owner, data, replacing=None):
+        """Protect compatibility using name/RRset prerequisites, never SOA serials."""
+        existing = [
+            (record, value)
+            for record, value in self._records.values()
+            if record["name"] == owner.to_text(omit_final_dot=True)
+        ]
+        aliases = [
+            (record, value) for record, value in existing if record["type"] == "CNAME"
+        ]
+        if data.rdtype == dns.rdatatype.SOA:
+            raise LexiconError("Le Bureau SOA records are read-only")
+        if data.rdtype == dns.rdatatype.CNAME:
+            if not aliases:
+                if existing:
+                    # A prerequisite cannot exclude every possible conflicting
+                    # type while requiring the old non-CNAME RRset to exist.
+                    raise LexiconError(
+                        "Le Bureau destination conflicts with CNAME; cannot safely "
+                        "convert an existing owner to CNAME"
+                    )
+                update.absent(owner)
+            else:
+                for record, value in aliases:
+                    if record["id"] != replacing and value != data:
+                        raise LexiconError(
+                            "Le Bureau update destination conflicts with CNAME"
+                        )
+                # When replacing this CNAME, update_record guards its exact
+                # source RRset. Otherwise guard the existing destination alias.
+                if not any(record["id"] == replacing for record, _ in aliases):
+                    update.present(owner, *[value for _, value in aliases])
+        elif aliases:
+            if not all(record["id"] == replacing for record, _ in aliases):
+                raise LexiconError("Le Bureau update destination conflicts with CNAME")
+            # The exact source CNAME prerequisite protects conversions away
+            # from CNAME: conflicting types cannot coexist with that alias.
+        else:
+            update.absent(owner, "CNAME")
+
+    def _guard_deletions(self, update, records):
+        """Reject protected apex removals and guard the remaining NS siblings."""
+        apex = self.zone.to_text(omit_final_dot=True)
+        removed = {record["id"] for record in records if record["name"] == apex}
+        if not removed:
+            return
+        apex_ns = []
+        deleting_ns = False
+        for record, value in self._records.values():
+            if record["name"] != apex:
+                continue
+            if record["id"] in removed and record["type"] == "SOA":
+                raise LexiconError("Le Bureau cannot delete or replace the apex SOA")
+            if record["type"] == "NS":
+                apex_ns.append((record, value))
+                deleting_ns |= record["id"] in removed
+        if deleting_ns:
+            if all(record["id"] in removed for record, _ in apex_ns):
+                raise LexiconError(
+                    "Le Bureau cannot delete or replace the last apex NS"
+                )
+            update.present(self.zone, *[value for _, value in apex_ns])
+
     def create_record(self, rtype, name, content):
         owner = self._name(name)
         data = self._rdata(rtype, content)
         if self.list_records(rtype, name, content):
             return True
         update = self._update()
+        self._guard_addition(update, owner, data)
         update.add(owner, int(self._ttl or 0) or 3600, data)
         return self._send(update)
 
@@ -349,54 +413,14 @@ class Provider(BaseProvider):
             )
         update = self._update()
         old_owner = self._name(record["name"])
-        destination = [
-            (existing, value)
-            for existing, value in self._records.values()
-            if self._name(existing["name"]) == owner and existing["id"] != record["id"]
-        ]
-        for existing, value in destination:
-            if value.rdtype in (
-                dns.rdatatype.RRSIG,
-                dns.rdatatype.NSEC,
-                dns.rdatatype.NSEC3,
-                dns.rdatatype.SIG,
-                dns.rdatatype.KEY,
-                dns.rdatatype.NXT,
-            ):
-                continue
-            if (data.rdtype == dns.rdatatype.CNAME) != (
-                value.rdtype == dns.rdatatype.CNAME
-            ) or (data.rdtype == dns.rdatatype.CNAME and data != value):
-                raise LexiconError("Le Bureau update destination conflicts with CNAME")
-
-        # Guard the AXFR snapshot as well as the selected RRset. RFC 2136 can
-        # silently ignore conflicting additions even after deleting the source.
-        # The SOA guard also covers changes of other types during a conversion
-        # to CNAME at the same owner; unrelated zone changes may reject updates.
-        for existing, value in self._records.values():
-            if existing["type"] == "SOA" and self._name(existing["name"]) == self.zone:
-                update.present(self.zone, value)
+        self._guard_addition(update, owner, data, replacing=record["id"])
+        self._guard_deletions(update, [record])
         source_data = [
             value
             for existing, value in self._records.values()
             if existing["name"] == record["name"] and existing["type"] == record["type"]
         ]
         update.present(old_owner, *source_data)
-        if owner != old_owner and not destination:
-            update.absent(owner)
-        elif data.rdtype != dns.rdatatype.CNAME and not (
-            owner == old_owner and old_data.rdtype == dns.rdatatype.CNAME
-        ):
-            update.absent(owner, "CNAME")
-        elif owner != old_owner:
-            update.present(
-                owner,
-                *[
-                    value
-                    for _, value in destination
-                    if value.rdtype == dns.rdatatype.CNAME
-                ],
-            )
         update.delete(old_owner, old_data)
         ttl = record["ttl"] if self._ttl is None else (int(self._ttl or 0) or 3600)
         update.add(owner, ttl, data)
@@ -415,6 +439,7 @@ class Provider(BaseProvider):
         if not matches:
             return True
         update = self._update()
+        self._guard_deletions(update, matches)
         for record in matches:
             update.delete(self._name(record["name"]), self._records[record["id"]][1])
         return self._send(update)

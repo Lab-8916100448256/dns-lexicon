@@ -35,7 +35,9 @@ lebureau
     The global ``domain`` option selects the zone; use Lexicon's ``delegated``
     option for a delegated subzone. Authentication reads the zone with a signed
     AXFR. Listings always consume a complete transfer, even with filters.
-    Supported types include A, AAAA, CAA, CNAME, MX, NS, SOA, SRV and TXT.
+    Supported types include A, AAAA, CAA, CNAME, MX, NS, SRV and TXT. SOA records
+    can be listed but are read-only. Removal or replacement of the last apex NS
+    is rejected; deleting an apex NS is allowed when another remains.
 
     TXT content can be a plain logical value or DNS quoted character strings.
     Long values are split into strings of at most 255 bytes. Listings return
@@ -48,10 +50,16 @@ lebureau
     TTL applies to the entire RRset: an update without an explicit TTL preserves
     the selected record's TTL; zero resets it to the default of 3600 seconds.
 
-    Updates reject incompatible CNAME destinations before deleting the source.
-    DNS prerequisites check the source RRset, destination compatibility and the
-    transferred SOA. Concurrent zone changes can cause an update to be rejected,
-    including changes elsewhere in the zone. Check the records before retrying.
+    Creates and updates reject incompatible CNAME destinations. DNS prerequisites
+    guard name absence, CNAME state and the exact source RRset without relying on
+    SOA serial changes. Converting a non-CNAME record to CNAME at the same owner
+    is rejected because concurrent additions of other types cannot be excluded
+    safely. Use an empty destination name, or manage the conversion separately
+    with appropriate coordination. Creating a different CNAME at an existing
+    alias is rejected; use an update to change its target. Apex NS deletion also
+    guards the exact NS RRset so concurrent changes cannot leave a protected last
+    NS behind while reporting success. Check records before retrying a rejected
+    update.
 
     The provider implements the protocol independently of ``ddns`` to keep
     existing DDNS consumers unchanged. Its tests run Lexicon's shared V2

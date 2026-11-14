@@ -124,15 +124,42 @@ class DNSHandler:
             for rrset in query.authority:
                 owner = rrset.name.derelativize(server.zone.origin)
                 if rrset.deleting == dns.rdataclass.ANY:
-                    server.zone.delete_rdataset(owner, rrset.rdtype)
+                    node = server.zone.get_node(owner)
+                    if node:
+                        for dataset in list(node.rdatasets):
+                            if rrset.rdtype not in (dns.rdatatype.ANY, dataset.rdtype):
+                                continue
+                            if owner == server.zone.origin and dataset.rdtype in (
+                                dns.rdatatype.SOA,
+                                dns.rdatatype.NS,
+                            ):
+                                continue
+                            server.zone.delete_rdataset(owner, dataset.rdtype)
                 elif rrset.deleting == dns.rdataclass.NONE:
                     rdataset = server.zone.get_rdataset(owner, rrset.rdtype)
                     if rdataset is not None:
                         for data in rrset:
+                            if owner == server.zone.origin and (
+                                rrset.rdtype == dns.rdatatype.SOA
+                                or (
+                                    rrset.rdtype == dns.rdatatype.NS
+                                    and len(rdataset) == 1
+                                )
+                            ):
+                                continue
                             rdataset.discard(data)
                         if not rdataset:
                             server.zone.delete_rdataset(owner, rrset.rdtype)
                 else:
+                    if rrset.rdtype == dns.rdatatype.SOA:
+                        current = server.zone.get_rdataset(owner, "SOA")
+                        if current is None:
+                            continue
+                        delta = (
+                            next(iter(rrset)).serial - next(iter(current)).serial
+                        ) % 2**32
+                        if not 0 < delta < 2**31:
+                            continue
                     node = server.zone.get_node(owner)
                     if node and any(
                         (rrset.rdtype == dns.rdatatype.CNAME)
@@ -1149,6 +1176,13 @@ def test_cname_type_conversion_at_same_owner(authoritative_server, rtype, conten
     )
     provider.create_record(old_type, "source", old_content)
     source = provider.list_records(old_type, "source")[0]
+    if rtype == "CNAME":
+        writes = authoritative_server.writes
+        with pytest.raises(LexiconError, match="cannot safely convert"):
+            provider.update_record(source["id"], rtype=rtype, content=content)
+        assert authoritative_server.writes == writes
+        assert provider.list_records(name="source") == [source]
+        return
     assert provider.update_record(source["id"], rtype=rtype, content=content)
     records = provider.list_records(name="source")
     assert len(records) == 1
@@ -1181,7 +1215,187 @@ def test_update_existing_destination_prerequisites(authoritative_server, change)
             )
 
     server.before_update = concurrent_write
+    if change == "soa":
+        assert provider.update_record(source["id"], name="destination")
+        assert not provider.list_records("A", "source")
+        assert provider.list_records("A", "destination", "192.0.2.1")
+        return
     with pytest.raises(LexiconError, match="NXRRSET|YXRRSET"):
         provider.update_record(source["id"], name="destination")
     assert provider.list_records("A", "source") == [source]
     assert not provider.list_records("A", "destination", "192.0.2.1")
+
+
+def test_conversion_to_cname_rejects_before_racing_txt_add(authoritative_server):
+    server = authoritative_server
+    provider = Provider(config(server))
+    provider.create_record("A", "source", "192.0.2.1")
+    source = provider.list_records("A", "source")[0]
+    original_list = provider.list_records
+
+    def list_then_race(*args, **kwargs):
+        records = original_list(*args, **kwargs)
+        server.zone.replace_rdataset(
+            "source.example.com.",
+            dns.rrset.from_text(
+                "source.example.com.", 120, "IN", "TXT", '"concurrent"'
+            ),
+        )
+        return records
+
+    provider.list_records = list_then_race
+    writes = server.writes
+    with pytest.raises(LexiconError, match="cannot safely convert"):
+        provider.update_record(
+            source["id"], rtype="CNAME", content="target.example.com."
+        )
+    assert server.writes == writes
+    assert original_list("A", "source") == [source]
+    assert original_list("TXT", "source")
+
+
+@pytest.mark.parametrize(
+    "rtype,value,existing_type,existing_value",
+    [
+        ("CNAME", "target.example.com.", "A", "192.0.2.1"),
+        ("A", "192.0.2.1", "CNAME", "target.example.com."),
+        ("CNAME", "new.example.com.", "CNAME", "old.example.com."),
+    ],
+)
+def test_create_rejects_existing_conflict(
+    authoritative_server, rtype, value, existing_type, existing_value
+):
+    server = authoritative_server
+    provider = Provider(config(server))
+    provider.create_record(existing_type, "owner", existing_value)
+    before = provider.list_records(name="owner")
+    writes = server.writes
+    with pytest.raises(LexiconError, match="destination conflicts"):
+        provider.create_record(rtype, "owner", value)
+    assert server.writes == writes
+    assert provider.list_records(name="owner") == before
+
+
+@pytest.mark.parametrize(
+    "rtype,value,concurrent_type,concurrent_value",
+    [
+        ("CNAME", "target.example.com.", "A", "192.0.2.1"),
+        ("CNAME", "target.example.com.", "TXT", '"concurrent"'),
+        ("CNAME", "target.example.com.", "CNAME", "other.example.com."),
+        ("A", "192.0.2.1", "CNAME", "target.example.com."),
+    ],
+)
+def test_create_prerequisites_reject_racing_conflict(
+    authoritative_server, rtype, value, concurrent_type, concurrent_value
+):
+    server = authoritative_server
+    provider = Provider(config(server))
+
+    def concurrent_write():
+        server.zone.replace_rdataset(
+            "owner.example.com.",
+            dns.rrset.from_text(
+                "owner.example.com.", 120, "IN", concurrent_type, concurrent_value
+            ),
+        )
+
+    server.before_update = concurrent_write
+    with pytest.raises(LexiconError, match="YXDOMAIN|YXRRSET"):
+        provider.create_record(rtype, "owner", value)
+    records = provider.list_records(name="owner")
+    assert len(records) == 1
+    assert records[0]["type"] == concurrent_type
+    assert records[0]["content"] == concurrent_value.strip('"')
+
+
+@pytest.mark.parametrize("by_id", [True, False])
+@pytest.mark.parametrize("rtype", ["SOA", "NS"])
+def test_delete_rejects_protected_apex(authoritative_server, rtype, by_id):
+    server = authoritative_server
+    provider = Provider(config(server))
+    before = provider.list_records()
+    record = provider.list_records(rtype, "@")[0]
+    writes = server.writes
+    with pytest.raises(LexiconError, match="apex SOA|last apex NS"):
+        if by_id:
+            provider.delete_record(record["id"])
+        else:
+            provider.delete_record(rtype=rtype, name="@")
+    assert server.writes == writes
+    assert provider.list_records() == before
+
+
+def test_delete_all_apex_ns_rejected_but_one_sibling_allowed(authoritative_server):
+    server = authoritative_server
+    provider = Provider(config(server))
+    provider.create_record("NS", "@", "second.example.com.")
+    records = provider.list_records("NS", "@")
+    writes = server.writes
+    with pytest.raises(LexiconError, match="last apex NS"):
+        provider.delete_record(rtype="NS", name="@")
+    assert server.writes == writes
+    assert provider.delete_record(records[0]["id"])
+    assert provider.list_records("NS", "@") == [records[1]]
+
+
+def test_delete_apex_ns_guards_concurrent_sibling_removal(authoritative_server):
+    server = authoritative_server
+    provider = Provider(config(server))
+    provider.create_record("NS", "@", "second.example.com.")
+    selected, sibling = provider.list_records("NS", "@")
+
+    def concurrent_write():
+        server.zone.find_rdataset(server.zone.origin, "NS").discard(
+            provider._rdata("NS", sibling["content"])
+        )
+
+    server.before_update = concurrent_write
+    with pytest.raises(LexiconError, match="NXRRSET"):
+        provider.delete_record(selected["id"])
+    assert provider.list_records("NS", "@") == [selected]
+
+
+@pytest.mark.parametrize("deletion", ["soa_value", "ns_value", "ns_set", "owner"])
+def test_wire_authority_ignores_protected_apex_deletions(
+    authoritative_server, deletion
+):
+    provider = Provider(config(authoritative_server))
+    soa = provider.list_records("SOA", "@")[0]
+    ns = provider.list_records("NS", "@")[0]
+    update = provider._update()
+    if deletion == "soa_value":
+        update.delete("@", provider._rdata("SOA", soa["content"]))
+    elif deletion == "ns_value":
+        update.delete("@", provider._rdata("NS", ns["content"]))
+    elif deletion == "ns_set":
+        update.delete("@", "NS")
+    else:
+        update.delete("@")
+    assert provider._send(update)
+    assert provider.list_records("SOA", "@")
+    assert provider.list_records("NS", "@") == [ns]
+
+
+def test_delete_mixed_apex_records_rejects_before_any_write(authoritative_server):
+    provider = Provider(config(authoritative_server))
+    provider.create_record("TXT", "@", "keep")
+    before = provider.list_records()
+    writes = authoritative_server.writes
+    with pytest.raises(LexiconError, match="apex SOA|last apex NS"):
+        provider.delete_record(name="@")
+    assert authoritative_server.writes == writes
+    assert provider.list_records() == before
+
+
+def test_soa_mutations_rejected_and_identical_create_is_noop(authoritative_server):
+    provider = Provider(config(authoritative_server))
+    record = provider.list_records("SOA", "@")[0]
+    data = provider._rdata("SOA", record["content"])
+    changed = data.replace(serial=data.serial + 1).to_text()
+    writes = authoritative_server.writes
+    assert provider.create_record("SOA", "@", record["content"])
+    with pytest.raises(LexiconError, match="read-only"):
+        provider.create_record("SOA", "@", changed)
+    with pytest.raises(LexiconError, match="read-only|apex SOA"):
+        provider.update_record(record["id"], content=changed)
+    assert authoritative_server.writes == writes
