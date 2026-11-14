@@ -226,11 +226,11 @@ class ScopedProvider:
         if original["id"] not in {r["id"] for r in updated}:
             wait_until(
                 lambda: (
-                    not self.list_records(
-                        original["type"],
-                        original["name"],
-                        original["content"],
-                    )
+                    original["id"]
+                    not in {
+                        r["id"]
+                        for r in self.list_records(original["type"], original["name"])
+                    }
                 )
             )
         return result

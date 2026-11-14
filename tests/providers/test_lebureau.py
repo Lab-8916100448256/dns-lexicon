@@ -371,6 +371,11 @@ class TestLeBureauProvider(IntegrationTestsV2):
         wait_until(lambda: records(owner))
         record = records(owner)[0]
         assert record["ttl"] == 3600
+        if rtype == "MX":
+            assert record["content"] == "mail.example.com."
+            assert record["options"] == {"mx": {"priority": 10}}
+        elif rtype == "CNAME":
+            assert record["content"] == "target.example.com."
         with Client(settings) as client:
             assert client.update_record(record["id"], name=moved)
         wait_until(lambda: records(moved) and not records(owner))
@@ -378,6 +383,40 @@ class TestLeBureauProvider(IntegrationTestsV2):
         with Client(settings) as client:
             assert client.delete_record(changed["id"])
         wait_until(lambda: not records(moved))
+
+    def test_public_client_mx_priority_option(self):
+        if self.live_zone is not None:
+            base = self.live_zone.config
+            owner = self.live_zone.name("mx-options")
+            self.live_zone.names.add(owner)
+        else:
+            base = config(self.server)
+            owner = "mx-options.example.com"
+
+        def settings(priority):
+            resolver = ConfigResolver().with_dict({"priority": priority})
+            for source in base._config_sources:
+                resolver.with_config_source(source)
+            return resolver
+
+        def records():
+            with Client(base) as client:
+                return client.list_records("MX", owner)
+
+        with Client(settings(10)) as client:
+            assert client.create_record("MX", owner, "mail.example.net.")
+        wait_until(lambda: records())
+        original = records()[0]
+        assert original["content"] == "mail.example.net."
+        assert original["options"] == {"mx": {"priority": 10}}
+        with Client(settings(0)) as client:
+            assert client.update_record(original["id"], content="new.example.net.")
+        wait_until(lambda: records() and records()[0]["options"]["mx"]["priority"] == 0)
+        updated = records()[0]
+        assert updated["content"] == "new.example.net."
+        with Client(base) as client:
+            assert client.delete_record(updated["id"])
+        wait_until(lambda: not records())
 
     @pytest.mark.parametrize(
         "value",
@@ -1399,3 +1438,178 @@ def test_soa_mutations_rejected_and_identical_create_is_noop(authoritative_serve
     with pytest.raises(LexiconError, match="read-only|apex SOA"):
         provider.update_record(record["id"], content=changed)
     assert authoritative_server.writes == writes
+
+
+@pytest.mark.parametrize(
+    "rtype,content,target_field",
+    [
+        ("CNAME", "target.example.net", "target"),
+        ("NS", "target.example.net", "target"),
+        ("MX", "10 target.example.net", "exchange"),
+        ("SRV", "10 20 443 target.example.net", "target"),
+    ],
+)
+@pytest.mark.parametrize("absolute", [False, True])
+def test_hostname_content_uses_dns_presentation_semantics(
+    authoritative_server, rtype, content, target_field, absolute
+):
+    provider = Provider(config(authoritative_server))
+    supplied = content + ("." if absolute else "")
+    expected = "target.example.net." if absolute else "target.example.net.example.com."
+    assert provider.create_record(rtype, "owner", supplied)
+    data = next(
+        iter(authoritative_server.zone.find_rdataset("owner.example.com.", rtype))
+    )
+    assert getattr(data, target_field).to_text() == expected
+    record = provider.list_records(rtype, "owner", supplied)[0]
+    # Listings always expose absolute targets, including MX's exchange field.
+    assert record["content"].endswith(expected)
+    assert provider.list_records(rtype, "owner", record["content"]) == [record]
+    assert provider.delete_record(rtype=rtype, name="owner", content=supplied)
+    assert not provider.list_records(rtype, "owner")
+
+
+@pytest.mark.parametrize("priority", [0, 10, "20"])
+def test_mx_priority_option_and_listing(authoritative_server, priority):
+    with Client(config(authoritative_server, priority=priority)) as client:
+        assert client.create_record("MX", "mail", "mail.example.net.")
+        record = client.list_records("MX", "mail")[0]
+        assert record["content"] == "mail.example.net."
+        assert record["options"] == {"mx": {"priority": int(priority)}}
+        data = next(
+            iter(authoritative_server.zone.find_rdataset("mail.example.com.", "MX"))
+        )
+        assert data.preference == int(priority)
+        assert data.exchange.to_text() == "mail.example.net."
+
+
+def test_mx_inline_priority_default_and_explicit_override(authoritative_server):
+    provider = Provider(config(authoritative_server))
+    assert provider.create_record("MX", "mail", "mail.example.net.")
+    default = provider.list_records("MX", "mail")[0]
+    assert default["options"]["mx"]["priority"] == 10
+    assert provider.create_record("MX", "mail", "20 mail.example.net.")
+    records = provider.list_records("MX", "mail", "mail.example.net.")
+    assert {r["options"]["mx"]["priority"] for r in records} == {10, 20}
+    assert len(provider.list_records("MX", "mail", "20 mail.example.net.")) == 1
+    override = Provider(config(authoritative_server, priority=30))
+    assert override.create_record("MX", "mail", "20 mail.example.net.")
+    assert len(provider.list_records("MX", "mail")) == 3
+    writes = authoritative_server.writes
+    assert override.create_record("MX", "mail", "mail.example.net.")
+    assert override.create_record("MX", "mail", "20 mail.example.net.")
+    assert authoritative_server.writes == writes
+    assert provider.delete_record(
+        rtype="MX", name="mail", content="20 mail.example.net."
+    )
+    assert {
+        r["options"]["mx"]["priority"] for r in provider.list_records("MX", "mail")
+    } == {10, 30}
+    assert provider.delete_record(rtype="MX", name="mail", content="mail.example.net.")
+    assert not provider.list_records("MX", "mail")
+
+
+def test_mx_updates_preserve_priority_and_siblings(authoritative_server):
+    server = authoritative_server
+    provider = Provider(config(server))
+    provider.create_record("MX", "mail", "20 mail.example.net.")
+    provider.create_record("MX", "mail", "30 mail.example.net.")
+    selected = provider.list_records("MX", "mail", "20 mail.example.net.")[0]
+    sibling = provider.list_records("MX", "mail", "30 mail.example.net.")[0]
+    # Updating just the exchange preserves the selected preference.
+    assert provider.update_record(selected["id"], content="new.example.net.")
+    changed = provider.list_records("MX", "mail", "new.example.net.")[0]
+    assert changed["options"]["mx"]["priority"] == 20
+    # Full presentation input can change preference without a separate option.
+    assert provider.update_record(changed["id"], content="25 newer.example.net.")
+    changed = provider.list_records("MX", "mail", "newer.example.net.")[0]
+    assert changed["options"]["mx"]["priority"] == 25
+    # A priority-only update uses a fresh client's option, including zero.
+    with Client(config(server, priority=0)) as client:
+        assert client.update_record(changed["id"])
+        changed = client.list_records("MX", "mail", "newer.example.net.")[0]
+        assert changed["options"]["mx"]["priority"] == 0
+        assert sibling in client.list_records("MX", "mail")
+    # An independent client preserves that priority when moving by ID.
+    with Client(config(server)) as client:
+        assert client.update_record(changed["id"], name="moved")
+        moved = client.list_records("MX", "moved")[0]
+        assert moved["options"]["mx"]["priority"] == 0
+        assert moved["content"] == "newer.example.net."
+        assert client.list_records("MX", "mail") == [sibling]
+
+
+@pytest.mark.parametrize("priority", [-1, 65536, "invalid", "1.5"])
+def test_mx_invalid_priority_rejected_before_write(authoritative_server, priority):
+    provider = Provider(config(authoritative_server, priority=priority))
+    with pytest.raises((ValueError, dns.exception.DNSException)):
+        provider.create_record("MX", "mail", "mail.example.net.")
+    assert authoritative_server.writes == 0
+
+
+@pytest.mark.parametrize("source", ["env", "file", "dict", "omitted"])
+@pytest.mark.parametrize("ttl", [0, 180])
+@pytest.mark.parametrize("provider_key", ["provider_name", "provider", None])
+def test_legacy_dict_ttl_resolution(
+    authoritative_server, monkeypatch, tmp_path, source, ttl, provider_key
+):
+    server = authoritative_server
+    with Client(config(server, ttl=120)) as client:
+        client.create_record("TXT", "original", "value")
+        original = client.list_records("TXT", "original")[0]
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LEXICON_TTL", raising=False)
+    settings = {
+        "domain": "example.com",
+        "auth_token": TOKEN,
+        "ddns_server": "127.0.0.1",
+        "ddns_port": server.server_address[1],
+    }
+    if provider_key:
+        settings[provider_key] = "lebureau"
+    if source == "env":
+        monkeypatch.setenv("LEXICON_TTL", str(ttl))
+        (tmp_path / "lexicon.yml").write_text("ttl: 240\n")
+    elif source == "file":
+        (tmp_path / "lexicon.yml").write_text(f"ttl: {ttl}\n")
+    elif source == "dict":
+        settings["ttl"] = ttl
+        monkeypatch.setenv("LEXICON_TTL", "240")
+    before = settings.copy()
+    with pytest.warns(DeprecationWarning, match="Legacy configuration"):
+        provider = Provider(settings)
+    assert settings == before
+    assert provider.create_record("TXT", "created", "value")
+    assert provider.list_records("TXT", "created")[0]["ttl"] == (
+        3600 if source == "omitted" or ttl == 0 else ttl
+    )
+    assert provider.update_record(original["id"], content="changed")
+    assert provider.list_records("TXT", "original")[0]["ttl"] == (
+        120 if source == "omitted" else (ttl or 3600)
+    )
+    # Reusing the same caller dictionary must not acquire the base default.
+    with pytest.warns(DeprecationWarning, match="Legacy configuration"):
+        reopened = Provider(settings)
+    changed = reopened.list_records("TXT", "original")[0]
+    assert reopened.update_record(changed["id"], name="moved")
+    assert reopened.list_records("TXT", "moved")[0]["ttl"] == changed["ttl"]
+    assert settings == before
+
+
+def test_live_adapter_mx_priority_update_preserves_same_exchange_sibling(
+    authoritative_server,
+):
+    zone = LiveZone(config(authoritative_server))
+    zone.prepare()
+    try:
+        provider = zone.provider()
+        provider.create_record("MX", "mail", "10 mail.example.net.")
+        provider.create_record("MX", "mail", "20 mail.example.net.")
+        selected = provider.list_records("MX", "mail", "10 mail.example.net.")[0]
+        sibling = provider.list_records("MX", "mail", "20 mail.example.net.")[0]
+        assert provider.update_record(selected["id"], content="30 mail.example.net.")
+        records = provider.list_records("MX", "mail")
+        assert sibling in records
+        assert {r["options"]["mx"]["priority"] for r in records} == {20, 30}
+    finally:
+        zone.cleanup()

@@ -21,7 +21,7 @@ import dns.tsig
 import dns.update
 import dns.zone
 
-from lexicon.config import ConfigResolver
+from lexicon.config import ConfigResolver, legacy_config_resolver
 from lexicon.exceptions import AuthenticationError, LexiconError
 from lexicon.interfaces import Provider as BaseProvider
 
@@ -62,21 +62,18 @@ class Provider(BaseProvider):
         )
 
     def __init__(self, config):
-        self._ttl = (
-            config.resolve("lexicon:ttl")
-            if isinstance(config, ConfigResolver)
-            else config.get("ttl")
-        )
+        if not isinstance(config, ConfigResolver):
+            config = config.copy()
+            if not config.get("provider_name"):
+                config["provider_name"] = config.get("provider") or "lebureau"
+            config = legacy_config_resolver(config)
+        self._ttl = config.resolve("lexicon:ttl")
         # BaseProvider appends a default TTL source. Keep it local so reopening
         # a Client does not turn an omitted update TTL into an explicit 3600.
-        if isinstance(config, ConfigResolver):
-            local_config = ConfigResolver()
-            for source in config._config_sources:
-                local_config.with_config_source(source)
-            config = local_config
-        else:
-            config = config.copy()
-        super().__init__(config)
+        local_config = ConfigResolver()
+        for source in config._config_sources:
+            local_config.with_config_source(source)
+        super().__init__(local_config)
         self.zone = dns.name.from_text(self.domain).canonicalize()
         self.server = self._get_provider_option("ddns_server") or "ns2.lebureau.coop"
         try:
@@ -202,6 +199,10 @@ class Provider(BaseProvider):
                     },
                     rdata,
                 )
+                if rdata.rdtype == dns.rdatatype.MX:
+                    records[identifier][0]["options"] = {
+                        "mx": {"priority": rdata.preference}
+                    }
         self._records = records
 
     def _name(self, name):
@@ -220,11 +221,23 @@ class Provider(BaseProvider):
             raise ValueError("Record name is outside the configured Le Bureau zone")
         return parsed.canonicalize()
 
-    def _rdata(self, rtype, content):
+    def _rdata(self, rtype, content, priority=None, default_priority=10):
         if rtype.upper() != "TXT":
-            return dns.rdata.from_text(
+            if rtype.upper() == "MX" and len(content.split()) == 1:
+                content = f"{default_priority} {content}"
+            data = dns.rdata.from_text(
                 "IN", rtype, content, origin=self.zone, relativize=False
             )
+            if data.rdtype == dns.rdatatype.MX and priority is not None:
+                # Parse again so dnspython validates the explicit priority as
+                # an unsigned 16-bit integer, including environment strings.
+                data = dns.rdata.from_text(
+                    "IN",
+                    "MX",
+                    f"{priority} {data.exchange.to_text()}",
+                    relativize=False,
+                )
+            return data
         if content.startswith('"'):
             tokenizer = dns.tokenizer.Tokenizer(content)
             strings = []
@@ -254,6 +267,8 @@ class Provider(BaseProvider):
 
     @staticmethod
     def _content(rdata):
+        if rdata.rdtype == dns.rdatatype.MX:
+            return rdata.exchange.to_text()
         if rdata.rdtype == dns.rdatatype.TXT:
             value = b"".join(rdata.strings)
             try:
@@ -284,6 +299,9 @@ class Provider(BaseProvider):
                     continue
                 if record["type"] == "TXT":
                     if b"".join(wanted.strings) != b"".join(rdata.strings):
+                        continue
+                elif record["type"] == "MX" and len(content.split()) == 1:
+                    if wanted.exchange != rdata.exchange:
                         continue
                 elif wanted != rdata:
                     continue
@@ -383,8 +401,11 @@ class Provider(BaseProvider):
 
     def create_record(self, rtype, name, content):
         owner = self._name(name)
-        data = self._rdata(rtype, content)
-        if self.list_records(rtype, name, content):
+        data = self._rdata(rtype, content, self._get_lexicon_option("priority"))
+        # MX duplicate identity includes priority, even though listings expose
+        # it separately from content and content-only filters match exchanges.
+        lookup = data.to_text() if data.rdtype == dns.rdatatype.MX else content
+        if self.list_records(rtype, name, lookup):
             return True
         update = self._update()
         self._guard_addition(update, owner, data)
@@ -406,10 +427,16 @@ class Provider(BaseProvider):
         owner = self._name(name if name is not None else record["name"])
         if content is None and (rtype is None or rtype.upper() == record["type"]):
             data = old_data
+            if old_data.rdtype == dns.rdatatype.MX:
+                data = self._rdata(
+                    "MX", old_data.to_text(), self._get_lexicon_option("priority")
+                )
         else:
             data = self._rdata(
                 rtype or record["type"],
                 content if content is not None else record["content"],
+                self._get_lexicon_option("priority"),
+                old_data.preference if old_data.rdtype == dns.rdatatype.MX else 10,
             )
         update = self._update()
         old_owner = self._name(record["name"])

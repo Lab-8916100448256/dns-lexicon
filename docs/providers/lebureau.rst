@@ -39,6 +39,21 @@ lebureau
     can be listed but are read-only. Removal or replacement of the last apex NS
     is rejected; deleting an apex NS is allowed when another remains.
 
+    Hostname targets in content use DNS presentation syntax. A target without a
+    final dot is relative to the configured zone: in ``example.com``, the CNAME
+    content ``target.example.net`` means ``target.example.net.example.com.``.
+    Use ``target.example.net.`` for an absolute target. This applies to CNAME and
+    NS targets, MX exchanges and SRV targets. Listings return absolute targets.
+
+    MX content can be an exchange hostname with the common ``priority`` option
+    (CLI ``--priority``, environment ``LEXICON_PRIORITY``), or complete DNS syntax
+    such as ``10 mail.example.net.``. An explicit priority overrides an embedded
+    priority; otherwise a bare exchange defaults to 10 on creation. Updating only
+    an existing MX exchange preserves its priority when no explicit or embedded
+    priority is supplied. Listings return the exchange as ``content`` and the
+    integer priority as ``options.mx.priority``. A content filter containing only
+    an exchange matches all its priorities; complete MX syntax selects one.
+
     TXT content can be a plain logical value or DNS quoted character strings.
     Long values are split into strings of at most 255 bytes. Listings return
     concatenated logical content without surrounding quotes where possible;
