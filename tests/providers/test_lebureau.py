@@ -17,6 +17,7 @@ remain offline. DNS traffic is never recorded by VCR.py.
 import base64
 import io
 import os
+import socket
 import struct
 
 import dns.exception
@@ -248,6 +249,10 @@ class MemorySocket:
     """
 
     def __init__(self, server):
+        # dnspython inspects socket metadata when choosing the AXFR transport.
+        self.type = socket.SOCK_STREAM
+        self.family = socket.AF_INET
+        self.proto = 0
         self.server = server
         self.pending = bytearray()
         self.replies = io.BytesIO()
