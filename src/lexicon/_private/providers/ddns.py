@@ -35,6 +35,12 @@ class Provider(BaseProvider):
             help="specify the key used in format <alg>:<key_id>:<secret>",
         )
         parser.add_argument("--ddns-server", help="specify IP of the DDNS server")
+        parser.add_argument(
+            "--timeout",
+            default=10,
+            type=int,
+            help="DNS operation timeout in seconds (default: 10)",
+        )
 
     def __init__(self, config):
         super().__init__(config)
@@ -42,10 +48,11 @@ class Provider(BaseProvider):
         self.keyring = dns.tsigkeyring.from_text({keyid: (alg, secret)})
         self.endpoint = self._get_provider_option("ddns_server")
         self.zone = self._get_provider_option("domain")
+        self.timeout = self._get_provider_option("timeout")
         self.cached_zone_content = {}
 
     def _run_query(self, message):
-        return dns.query.tcp(message, self.endpoint, timeout=10)
+        return dns.query.tcp(message, self.endpoint, timeout=self.timeout)
 
     def authenticate(self):
         if not self.endpoint:
@@ -63,7 +70,9 @@ class Provider(BaseProvider):
         name = dns.name.from_text(name).relativize(dns.name.from_text(self.zone))
 
         update = dns.update.Update(self.zone, keyring=self.keyring)
-        update.add(name, ttl, rtype, content)
+    
+        chunks = ['"' + content[i:i + 255] + '"' for i in range(0, len(content), 255)]
+        update.add(name, ttl, rtype, " ".join(chunks))
         self._run_query(update)
         return True
 
@@ -166,10 +175,9 @@ class Provider(BaseProvider):
         pass
 
 
-def _identifier(record):
+def _identifier(rtype, name, content):
     m = hashlib.sha256()
-    m.update(("type=" + record.get("type", "") + ",").encode("utf-8"))
-    m.update(("name=" + record.get("name", "") + ",").encode("utf-8"))
-    m.update(("content=" + record.get("content", "") + ",").encode("utf-8"))
-
+    m.update(("type=" + rtype).encode("utf-8"))
+    m.update(("name=" + name).encode("utf-8"))
+    m.update(("content=" + content).encode("utf-8"))
     return m.hexdigest()[0:7]
